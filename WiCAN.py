@@ -13,8 +13,9 @@ from PyQt5.QtWidgets import QBoxLayout, QGridLayout, QFrame
 from PyQt5.QtWidgets import QAction, QMenu
 from PyQt5.QtWidgets import QWidget, QTextEdit, QLabel, QComboBox, QGroupBox, QPushButton, QLineEdit, QCheckBox
 from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView
-from PyQt5.QtWidgets import QListWidgetItem, QListWidget
+from PyQt5.QtWidgets import QListWidgetItem, QListWidget, QAbstractScrollArea
 from PyQt5.QtWidgets import QInputDialog, QFileDialog
+from PyQt5.QtWidgets import QSizePolicy
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtCore import QThread, QWaitCondition, QMutex
@@ -87,6 +88,7 @@ class MDIWindow(QMainWindow):
         self.can_row = 0
         self.can_data = {}
         self.dbc_windows = {}
+        self.dbc_send_windows = {}
         self.config = configparser.ConfigParser()
         self.recentDBCFiles = {}
         
@@ -127,6 +129,10 @@ class MDIWindow(QMainWindow):
         self.can_thread.can_status_signal.connect(self.handleCANStatus)
         self.can_thread.start()
 
+        timer = QTimer(self) 
+        timer.timeout.connect(self.tick) 
+        timer.start(50)
+
     def createCANTableSubWindow(self):
         self.can_table = QTableWidget(50,9)
         
@@ -134,6 +140,16 @@ class MDIWindow(QMainWindow):
         sub.setWidget(self.can_table)
         sub.setWindowTitle("Raw CAN Frames")
         self.mdi.addSubWindow(sub)
+        sub.setGeometry(0, 0, 400, 800)
+
+        self.can_table.verticalHeader().hide()
+        self.can_table.setHorizontalHeaderItem(0, QTableWidgetItem("ID"))
+        self.can_table.setColumnWidth(0,10)
+        for i in range(1,9):
+            item = QTableWidgetItem(str(i-1))
+            self.can_table.setHorizontalHeaderItem(i, item)
+            self.can_table.setColumnWidth(i,10)
+        
         sub.show()
 
     def fileMenuClicked(self, menuitem):
@@ -189,12 +205,19 @@ class MDIWindow(QMainWindow):
             self.loadDBCFile(file_path)
 
     def loadDBCFile(self, file_path):
-            dbc_win = DBCWindow(file_path, self)
+            dbc_win = DBCRecvWindow(file_path, self)
             sub = QMdiSubWindow()
             sub.setWidget(dbc_win)
             sub.setGeometry(100, 100, 500, 500)
             self.mdi.addSubWindow(sub)
             sub.show()
+
+            dbc_send_win = DBCSendWindow(file_path, self)
+            sub2 = QMdiSubWindow()
+            sub2.setWidget(dbc_send_win)
+            sub2.setGeometry(100, 100, 500, 500)
+            self.mdi.addSubWindow(sub2)
+            sub2.show()
 
             self.config["RecentDBCs"][os.path.basename(file_path)] = file_path
             self.recentDBCFiles[os.path.basename(file_path)] = file_path
@@ -272,7 +295,11 @@ class MDIWindow(QMainWindow):
             item = QTableWidgetItem(hex(msg.data[c]))
             self.can_table.setItem(row, c+1, item)
 
-class DBCWindow(QWidget):
+    def tick(self):
+        for file_name,window in self.dbc_send_windows.items():
+            window.tick()
+
+class DBCRecvWindow(QWidget):
     def __init__(self, file_path, parent):
         QWidget.__init__(self, flags=Qt.Widget)
 
@@ -287,9 +314,16 @@ class DBCWindow(QWidget):
 
         self.list_recv = QListWidget()
         self.table_recv_ids = QTableWidget(len(self.dbc.messages), 2)
+        self.table_recv_ids.verticalHeader().hide()
+        self.table_recv_ids.setColumnWidth(0,10)
+        self.table_recv_ids.setColumnWidth(1,10)
+        self.table_recv_ids.setHorizontalHeaderItem(0, QTableWidgetItem("ID"))
+        self.table_recv_ids.setHorizontalHeaderItem(1, QTableWidgetItem("Show"))
 
         layout.addWidget(self.table_recv_ids)
         layout.addWidget(self.list_recv)
+        layout.addWidget(self.table_recv_ids, 1)
+        layout.addWidget(self.list_recv, 3)
 
         self.parent = parent
         self.parent.dbc_windows[self.file_name] = self
@@ -342,6 +376,122 @@ class DBCWindow(QWidget):
 
     def closeEvent(self, event):
         del self.parent.dbc_windows[self.file_name]
+
+class DBCSendWindow(QWidget):
+    def __init__(self, file_path, parent):
+        QWidget.__init__(self, flags=Qt.Widget)
+
+        self.file_name = os.path.basename(file_path)
+        self.can_list_map = {}
+        self.can_list_counter = 0
+        self.data_row_counter = 0
+        self.dbc = cantools.database.load_file(file_path, database_format='dbc', cache_dir=None)#file_name.split(".")[0])
+
+        self.setWindowTitle(self.file_name)
+        layout = QBoxLayout(QBoxLayout.LeftToRight, parent=self)
+        self.setLayout(layout)
+
+        self.table_send_data = QTableWidget(50,4)
+        self.table_send_data.verticalHeader().hide()
+        self.table_send_data.setColumnWidth(0,10)
+        #self.table_send_data.setColumnWidth(1,50)
+        self.table_send_data.setColumnWidth(2,50)
+        #self.table_send_data.setColumnWidth(3,50)
+        self.table_send_data.setHorizontalHeaderItem(0, QTableWidgetItem("ID"))
+        self.table_send_data.setHorizontalHeaderItem(1, QTableWidgetItem("Signal"))
+        self.table_send_data.setHorizontalHeaderItem(2, QTableWidgetItem("Unit"))
+        self.table_send_data.setHorizontalHeaderItem(3, QTableWidgetItem("Data"))
+
+        self.table_send_ids = QTableWidget(len(self.dbc.messages), 3)
+        self.table_send_ids.verticalHeader().hide()
+        self.table_send_ids.setColumnWidth(0,10)
+        self.table_send_ids.setColumnWidth(1,10)
+        self.table_send_ids.setColumnWidth(2,10)
+        self.table_send_ids.setHorizontalHeaderItem(0, QTableWidgetItem("ID"))
+        self.table_send_ids.setHorizontalHeaderItem(1, QTableWidgetItem("Show"))
+        self.table_send_ids.setHorizontalHeaderItem(2, QTableWidgetItem("Xmit"))
+
+        layout.addWidget(self.table_send_ids, 1)
+        layout.addWidget(self.table_send_data, 2.4)
+
+        self.parent = parent
+        self.parent.dbc_send_windows[self.file_name] = self
+
+        i = 0
+        for message in self.dbc.messages:
+            item = QTableWidgetItem(hex(message.frame_id))
+            item.setFlags(item.flags() ^ Qt.ItemIsEditable)
+            self.table_send_ids.setItem(i, 0, item)
+
+            id_checkbox = QCheckBox()
+            id_checkbox.setProperty('can_id', hex(message.frame_id))
+            id_checkbox.clicked.connect(self.on_id_checkbox_change)
+            send_checkbox = QCheckBox()
+
+            item = QTableWidgetItem()
+            self.table_send_ids.setItem(i, 1, item)
+            self.table_send_ids.setCellWidget(i, 1, id_checkbox)
+
+            item = QTableWidgetItem()
+            self.table_send_ids.setItem(i, 2, item)
+            self.table_send_ids.setCellWidget(i, 2, send_checkbox)
+            
+            i += 1
+        self.table_send_ids.sortItems(0, Qt.AscendingOrder)
+
+    def tick(self):
+        for i in range(0,self.table_send_ids.rowCount()):
+            can_id = int(self.table_send_ids.item(i, 0).text(),16)
+            xmit = self.table_send_ids.cellWidget(i, 2).isChecked()
+            if xmit:
+                self.sendMessage(can_id)
+
+    def on_id_checkbox_change(self, checked):
+        checkbox = self.sender()
+        can_id = checkbox.property('can_id')
+
+        if can_id not in self.can_list_map.keys():
+            self.can_list_map[can_id] = self.can_list_counter
+
+            for signal in self.dbc.get_message_by_frame_id(int(can_id,16)).signals:
+                item = QTableWidgetItem(can_id)
+                item.setFlags(item.flags() ^ Qt.ItemIsEditable)
+                self.table_send_data.setItem(self.data_row_counter, 0, item)
+
+                item = QTableWidgetItem(signal.name)
+                item.setFlags(item.flags() ^ Qt.ItemIsEditable)
+                self.table_send_data.setItem(self.data_row_counter, 1, item)
+                self.table_send_data.setItem(self.data_row_counter, 2, QTableWidgetItem(signal.unit))
+                self.table_send_data.setItem(self.data_row_counter, 3, QTableWidgetItem("0"))
+
+                self.data_row_counter += 1
+            
+            self.can_list_counter += 1
+
+    def sendMessage(self, send_can_id):
+        dbc_msg = self.dbc.get_message_by_frame_id(send_can_id)
+        data = {}
+        for i in range(0,self.table_send_data.rowCount()):
+            if self.table_send_data.item(i, 0) == None:
+                continue
+            can_id = int(self.table_send_data.item(i, 0).text(),16)
+            if can_id != send_can_id:
+                continue
+            signal = self.table_send_data.item(i, 1).text()
+            value = self.table_send_data.item(i, 3).text()
+            data[signal] = int(value)
+
+        try:
+            data_bytes = dbc_msg.encode(data,scaling=True,padding=False,strict=True)
+            msg = can.Message(arbitration_id=send_can_id, is_extended_id=dbc_msg.is_extended_frame, data=data_bytes)
+        except:
+            traceback.print_exc()
+            return
+
+        self.parent.can_send_signal.emit(msg)
+
+    def closeEvent(self, event):
+        del self.parent.dbc_send_windows[self.file_name]
 
 class ConnectDialog(QDialog):
     def __init__(self, parent, last_connection):
