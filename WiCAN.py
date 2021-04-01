@@ -11,8 +11,9 @@ from PyQt5.QtWidgets import QApplication, QMainWindow, qApp, QDialog
 from PyQt5.QtWidgets import QMdiArea, QMdiSubWindow
 from PyQt5.QtWidgets import QBoxLayout, QGridLayout, QFrame
 from PyQt5.QtWidgets import QAction, QMenu
-from PyQt5.QtWidgets import QWidget, QTextEdit, QLabel, QComboBox, QGroupBox, QPushButton, QLineEdit
-from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView, QListWidget
+from PyQt5.QtWidgets import QWidget, QTextEdit, QLabel, QComboBox, QGroupBox, QPushButton, QLineEdit, QCheckBox
+from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView
+from PyQt5.QtWidgets import QListWidgetItem, QListWidget
 from PyQt5.QtWidgets import QInputDialog, QFileDialog
 
 from PyQt5.QtCore import Qt
@@ -86,7 +87,9 @@ class MDIWindow(QMainWindow):
         self.can_row = 0
         self.can_data = {}
         self.dbc_windows = {}
-
+        self.config = configparser.ConfigParser()
+        self.recentDBCFiles = {}
+        
         self.loadPreferences()
 
         self.mdi = QMdiArea()
@@ -94,10 +97,19 @@ class MDIWindow(QMainWindow):
         
         bar = self.menuBar()
 
+        recentDBCMenu = QMenu('Recent DBCs...', self)
+
         file = bar.addMenu("File")
         file.addAction("Connect")
         file.addAction("Open DBC")
         file.triggered[QAction].connect(self.fileMenuClicked)
+        file.addMenu(recentDBCMenu)
+
+        for dbcFile in self.recentDBCFiles.keys():
+            recentOpenAct = QAction(dbcFile, self)
+            # var c is used to handle the triggered first arg
+            recentOpenAct.triggered.connect(lambda c=dbcFile,f=dbcFile: self.loadDBCFile(self.recentDBCFiles[f])) 
+            recentDBCMenu.addAction(recentOpenAct)
 
         view = bar.addMenu("View")
         view.addAction("Cascade")
@@ -126,7 +138,7 @@ class MDIWindow(QMainWindow):
 
     def fileMenuClicked(self, menuitem):
         if menuitem.text() == "Connect":
-            diag = ConnectDialog(self)
+            diag = ConnectDialog(self, self.last_connection)
             diag.show()
             diag.exec_()
             settings = diag.getSettings()
@@ -143,18 +155,51 @@ class MDIWindow(QMainWindow):
     def loadPreferences(self):
         self.dbc_path = os.path.dirname(os.path.realpath(__file__))
 
+        inifile = self.config.read('wican.ini')
+
+        if len(inifile) == 0:
+            self.config['WiCAN'] = {'CANAdaptor': 'PCAN', 'CANBAUD': '250k', 'CANPATH': ''}
+            self.config['RecentDBCs'] = {}
+            self.saveConfig()
+            return
+
+        can_adapter = self.config['WiCAN'].get('CANAdaptor', 'KVaser')
+        can_baud = self.config['WiCAN'].get('CANBAUD', '250k')
+        can_path = self.config['WiCAN'].get('CANPATH', '')
+
+        self.last_connection = CANConnection(can_adapter, can_baud, can_path)
+
+        for file, path in self.config.items("RecentDBCs"):
+            if not os.path.exists(path):
+                self.config.remove_option("RecentDBCs", file)
+            else:
+                self.recentDBCFiles[file] = path
+
+    def saveConfig(self):
+        with open('wican.ini', 'w') as configfile:
+            self.config.write(configfile)
+            configfile.close()
+
     def loadDBCFileDialog(self):
         options = QFileDialog.Options()
         options |= QFileDialog.DontUseNativeDialog
         types = "DBC Files (*.dbc)"
         file_path, _ = QFileDialog.getOpenFileName(self, "Open DBC", self.dbc_path, types, options=options)
         if file_path:
+            self.loadDBCFile(file_path)
+
+    def loadDBCFile(self, file_path):
             dbc_win = DBCWindow(file_path, self)
             sub = QMdiSubWindow()
             sub.setWidget(dbc_win)
-            #sub.setWindowTitle("Raw CAN Frames")
+            sub.setGeometry(100, 100, 500, 500)
             self.mdi.addSubWindow(sub)
             sub.show()
+
+            self.config["RecentDBCs"][os.path.basename(file_path)] = file_path
+            self.recentDBCFiles[os.path.basename(file_path)] = file_path
+            self.dbc_path = os.path.split(file_path)[0]
+            self.saveConfig()
 
     @pyqtSlot(int)
     def handleCANStatus(self, status):
@@ -175,6 +220,11 @@ class MDIWindow(QMainWindow):
         bitrate = connection.bitrate
         path = connection.path
 
+        self.config["WiCAN"]["canadaptor"] = bustype
+        self.config["WiCAN"]["canbaud"] = bitrate
+        self.config["WiCAN"]["canpath"] = path
+
+        #TODO: clean up
         if bustype == 'PCAN':
             bustype = 'pcan'
             interface = 'PCAN_USBBUS1'
@@ -203,7 +253,7 @@ class MDIWindow(QMainWindow):
 
     @pyqtSlot(object)
     def handleCANMessage(self, msg):
-        for file_name,window in self.dbc_windows:
+        for file_name,window in self.dbc_windows.items():
             window.handleCANMessage(msg)
 
         can_id_hex = msg.arbitration_id
@@ -226,35 +276,75 @@ class DBCWindow(QWidget):
     def __init__(self, file_path, parent):
         QWidget.__init__(self, flags=Qt.Widget)
 
-        file_name = os.path.basename(file_path)
+        self.file_name = os.path.basename(file_path)
         self.can_list_map = {}
         self.list_counter = 0
         self.dbc = cantools.database.load_file(file_path, database_format='dbc', cache_dir=None)#file_name.split(".")[0])
 
-        self.setWindowTitle(file_name)
+        self.setWindowTitle(self.file_name)
         layout = QBoxLayout(QBoxLayout.LeftToRight, parent=self)
         self.setLayout(layout)
 
         self.list_recv = QListWidget()
-        self.list_send = QListWidget()
+        self.table_recv_ids = QTableWidget(len(self.dbc.messages), 2)
 
+        layout.addWidget(self.table_recv_ids)
         layout.addWidget(self.list_recv)
-        layout.addWidget(self.list_send)
 
         self.parent = parent
-        self.parent.dbc_windows[file_name] = self
+        self.parent.dbc_windows[self.file_name] = self
+
+        i = 0
+        for message in self.dbc.messages:
+            item = QTableWidgetItem(hex(message.frame_id))
+            item.setFlags(item.flags() ^ Qt.ItemIsEditable)
+            self.table_recv_ids.setItem(i, 0, item)
+
+            checkbox = QCheckBox()
+
+            item = QTableWidgetItem()
+            self.table_recv_ids.setItem(i, 1, item)
+            self.table_recv_ids.setCellWidget(i, 1, checkbox)
+            
+            i += 1
+        self.table_recv_ids.sortItems(0, Qt.AscendingOrder)
 
     def handleCANMessage(self, msg):
+        display = False
+        for i in range(0,self.table_recv_ids.rowCount()):
+            can_id = int(self.table_recv_ids.item(i, 0).text(),16)
+            checked = self.table_recv_ids.cellWidget(i, 1).isChecked()
+            if msg.arbitration_id == can_id and checked == True:
+                display = True
         try:
             frame = self.dbc.decode_message(msg.arbitration_id, msg.data, decode_choices=True, scaling=True)
         except:
             return
 
+        frame_str = hex(msg.arbitration_id)+":\n"
+        for signal in frame:
+            frame_str += signal + ": " + "{:.2f}".format(frame[signal])+"\n"
+
+        can_id = msg.arbitration_id
+
+        if can_id not in self.can_list_map.keys():
+            self.can_list_map[can_id] = self.list_counter
+            self.list_recv.addItem(QListWidgetItem(frame_str))
+            self.list_counter += 1
+
+        list_id = self.can_list_map[can_id]
+        if display:
+            self.list_recv.item(list_id).setText(frame_str)
+            self.list_recv.item(list_id).setHidden(False)
+        else:
+            self.list_recv.item(list_id).setText("")
+            self.list_recv.item(list_id).setHidden(True)
+
     def closeEvent(self, event):
-        del self.parent.dbc_windows[file_name]
+        del self.parent.dbc_windows[self.file_name]
 
 class ConnectDialog(QDialog):
-    def __init__(self, parent):
+    def __init__(self, parent, last_connection):
         super().__init__(parent)
 
         self.setWindowTitle("Connect")
@@ -262,20 +352,24 @@ class ConnectDialog(QDialog):
         grid = QGridLayout()
         
         self.combo_bustype = QComboBox()
-        self.combo_bustype.addItem("PCAN")
-        self.combo_bustype.addItem("KVaser")
-        self.combo_bustype.addItem("Ixxat")
-        self.combo_bustype.addItem("Serial")
-        self.combo_bustype.addItem("Socket")
+        i=0
+        for bustype in CANConnection.bustypes:
+            self.combo_bustype.addItem(bustype)
+            if bustype == last_connection.bustype:
+                self.combo_bustype.setCurrentIndex(i)
+            i += 1
         self.combo_bustype.activated[str].connect(self.onBusTypeChange)
 
         self.combo_rate = QComboBox()
-        self.combo_rate.addItem("500k")
-        self.combo_rate.addItem("250k")
-        self.combo_rate.addItem("1M")
-        self.combo_rate.addItem("125k")
-
+        i=0
+        for bitrate in CANConnection.bitrates:
+            self.combo_rate.addItem(bitrate)
+            if bitrate == last_connection.bitrate:
+                self.combo_rate.setCurrentIndex(i)
+            i += 1
+        
         self.path = QLineEdit(self)
+        self.path.setText(last_connection.path)
         
         self.btn_open = QPushButton("Connect")
         self.btn_open.clicked.connect(self.openClicked)
@@ -315,6 +409,8 @@ class ConnectDialog(QDialog):
         return settings
 
 class CANConnection():
+    bustypes = ["PCAN","KVaser","Ixxat","Serial","Socket"]
+    bitrates = ["125k","250k","500k","1M"]
     def __init__(self, bustype, bitrate, path):
         self.bustype = bustype
         self.bitrate = bitrate
