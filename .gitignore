@@ -200,3 +200,6 @@ wifi_manager/doc/
 # Visual Studio Code
 .vscode/
 
+wican.ini
+
+WiCANESP32/sdkconfig~

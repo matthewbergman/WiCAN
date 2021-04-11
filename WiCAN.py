@@ -23,6 +23,8 @@ from PyQt5.QtCore import pyqtSlot, pyqtSignal
 from PyQt5.QtCore import QTimer, QIODevice, QByteArray
 from PyQt5.QtGui import QColor, QIcon
 
+from version import VERSION
+
 class CANThread(QThread):
     can_recv_signal = pyqtSignal(object)
     can_status_signal = pyqtSignal(int)
@@ -118,7 +120,7 @@ class MDIWindow(QMainWindow):
         view.addAction("TiledC")
         view.triggered[QAction].connect(self.viewMenuClicked)
         
-        self.setWindowTitle("WiCAN")
+        self.setWindowTitle("WiCAN "+VERSION)
         self.statusBar().showMessage('Disconnected')
 
         self.createCANTableSubWindow()
@@ -254,9 +256,11 @@ class MDIWindow(QMainWindow):
         elif bustype == 'KVaser':
             bustype = 'kvaser'
             interface = '0'
-        elif bustype == 'IXXAT':
+        elif bustype == 'Ixxat':
             bustype = 'ixxat'
             interface = '0'
+        else:
+            print("Unknown bustype: "+bustype)
 
         if bitrate == "125k":
             bitrate = 125000
@@ -330,11 +334,12 @@ class DBCRecvWindow(QWidget):
 
         i = 0
         for message in self.dbc.messages:
-            item = QTableWidgetItem(hex(message.frame_id))
+            item = QTableWidgetItem(hex(message.frame_id)+" "+message.name)
             item.setFlags(item.flags() ^ Qt.ItemIsEditable)
             self.table_recv_ids.setItem(i, 0, item)
 
             checkbox = QCheckBox()
+            checkbox.setProperty('can_id', hex(message.frame_id))
 
             item = QTableWidgetItem()
             self.table_recv_ids.setItem(i, 1, item)
@@ -346,7 +351,8 @@ class DBCRecvWindow(QWidget):
     def handleCANMessage(self, msg):
         display = False
         for i in range(0,self.table_recv_ids.rowCount()):
-            can_id = int(self.table_recv_ids.item(i, 0).text(),16)
+            #can_id = int(self.table_recv_ids.item(i, 0).text(),16)
+            can_id = int(self.table_recv_ids.cellWidget(i, 1).property('can_id'),16)
             checked = self.table_recv_ids.cellWidget(i, 1).isChecked()
             if msg.arbitration_id == can_id and checked == True:
                 display = True
@@ -357,7 +363,10 @@ class DBCRecvWindow(QWidget):
 
         frame_str = hex(msg.arbitration_id)+":\n"
         for signal in frame:
-            frame_str += signal + ": " + "{:.2f}".format(frame[signal])+"\n"
+            if isinstance(frame[signal], str):
+                frame_str += signal + ": " + frame[signal] + "\n"
+            else:
+                frame_str += signal + ": " + "{:.2f}".format(frame[signal])+"\n"
 
         can_id = msg.arbitration_id
 
@@ -419,7 +428,7 @@ class DBCSendWindow(QWidget):
 
         i = 0
         for message in self.dbc.messages:
-            item = QTableWidgetItem(hex(message.frame_id))
+            item = QTableWidgetItem(hex(message.frame_id)+" "+message.name)
             item.setFlags(item.flags() ^ Qt.ItemIsEditable)
             self.table_send_ids.setItem(i, 0, item)
 
@@ -441,9 +450,9 @@ class DBCSendWindow(QWidget):
 
     def tick(self):
         for i in range(0,self.table_send_ids.rowCount()):
-            can_id = int(self.table_send_ids.item(i, 0).text(),16)
             xmit = self.table_send_ids.cellWidget(i, 2).isChecked()
             if xmit:
+                can_id = int(self.table_send_ids.cellWidget(i, 1).property('can_id'),16)
                 self.sendMessage(can_id)
 
     def on_id_checkbox_change(self, checked):
@@ -567,6 +576,7 @@ class CANConnection():
         self.path = path
 
 app = QApplication(sys.argv)
+app.setWindowIcon(QIcon('icon.ico'))
 mdi = MDIWindow()
 mdi.setGeometry(100, 100, 1000, 1000)
 mdi.show()

@@ -367,6 +367,7 @@ void task_BLE(void *pvParameters)
 				buffer[10+i] = message.data[i];
 			buffer[10+message.data_length_code] = 0xBB;
 			
+			// TODO: this should be notify! We don't need a response.
 			esp_ble_gatts_send_indicate(
 				spp_gatts_if, 
 				spp_conn_id, 
@@ -426,6 +427,7 @@ void task_CAN(void *pvParameters)
 				}
 				*/
 				
+				// TODO: clumsy attempt at priority messages
 				if (uxQueueSpacesAvailable(can_queue) > 5 || message.identifier == 0x101)
 					xQueueSend(can_queue, &message, pdMS_TO_TICKS(1));
 			}
