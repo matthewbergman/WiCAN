@@ -93,6 +93,8 @@ class MDIWindow(QMainWindow):
         self.dbc_send_windows = {}
         self.config = configparser.ConfigParser()
         self.recentDBCFiles = {}
+
+        self.last_connection = ""
         
         self.loadPreferences()
 

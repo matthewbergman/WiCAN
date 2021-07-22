@@ -566,7 +566,7 @@ void app_main()
 	
 	// Setup wifi manager to manage saved SSIDs
 	wifi_manager_start();
-	wifi_manager_set_callback(EVENT_STA_GOT_IP, &cb_connection_ok);
+	wifi_manager_set_callback(WM_EVENT_STA_GOT_IP, &cb_connection_ok);
 	
 	// Start BLE
 	adv_data.set_scan_rsp        = false;
