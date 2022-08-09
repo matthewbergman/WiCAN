@@ -64,13 +64,13 @@ class CANThread(QThread):
                 for msg in self.bus:
                     self.can_recv_signal.emit(msg)
             else:
-                time.sleep(1)
+                time.sleep(0.1)
 
     @pyqtSlot(object)
     def send(self, msg):
         if self.bus != None:
             try:
-                self.bus.send(msg, 1)
+                self.bus.send(msg, 0.1)
             except:
                 print("Failed to send CAN message")
         else:
@@ -368,7 +368,10 @@ class DBCRecvWindow(QWidget):
             if isinstance(frame[signal], str):
                 frame_str += signal + ": " + frame[signal] + "\n"
             else:
-                frame_str += signal + ": " + "{:.2f}".format(frame[signal])+"\n"
+                try:
+                    frame_str += signal + ": " + "{:.2f}".format(frame[signal])+"\n"
+                except:
+                    frame_str += signal + ": " + str(frame[signal])+"\n"
 
         can_id = msg.arbitration_id
 
@@ -402,7 +405,7 @@ class DBCSendWindow(QWidget):
         layout = QBoxLayout(QBoxLayout.LeftToRight, parent=self)
         self.setLayout(layout)
 
-        self.table_send_data = QTableWidget(50,4)
+        self.table_send_data = QTableWidget(150,4)
         self.table_send_data.verticalHeader().hide()
         self.table_send_data.setColumnWidth(0,10)
         #self.table_send_data.setColumnWidth(1,50)
@@ -423,7 +426,7 @@ class DBCSendWindow(QWidget):
         self.table_send_ids.setHorizontalHeaderItem(2, QTableWidgetItem("Xmit"))
 
         layout.addWidget(self.table_send_ids, 1)
-        layout.addWidget(self.table_send_data, 2.4)
+        layout.addWidget(self.table_send_data, 2)
 
         self.parent = parent
         self.parent.dbc_send_windows[self.file_name] = self
