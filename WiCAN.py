@@ -35,7 +35,7 @@ class CANThread(QThread):
         
     def connect(self, _type, _channel, _bitrate):
         try:
-            self.bus = can.interface.Bus(bustype=_type, channel=_channel, bitrate=_bitrate)
+            self.bus = can.interface.Bus(bustype=_type, channel=_channel, bitrate=_bitrate, single_handle=True)
             print("Connected to CAN device")
             self.can_status_signal.emit(0)
         except:
@@ -87,8 +87,10 @@ class MDIWindow(QMainWindow):
         super().__init__()
 
         self.pcan_state = self.PCAN_STATE_DISCONNECTED
-        self.can_row = 0
         self.can_data = {}
+        self.can_times = {}
+        self.can_time_last = {}
+        self.can_count = {}
         self.dbc_windows = {}
         self.dbc_send_windows = {}
         self.config = configparser.ConfigParser()
@@ -135,24 +137,26 @@ class MDIWindow(QMainWindow):
 
         timer = QTimer(self) 
         timer.timeout.connect(self.tick) 
-        timer.start(50)
+        timer.start(300)
 
     def createCANTableSubWindow(self):
-        self.can_table = QTableWidget(50,9)
+        self.can_table = QTableWidget(50,11)
+        self.can_table.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
         
         sub = QMdiSubWindow()
         sub.setWidget(self.can_table)
         sub.setWindowTitle("Raw CAN Frames")
         self.mdi.addSubWindow(sub)
-        sub.setGeometry(0, 0, 400, 800)
+        sub.setGeometry(0, 0, 500, 800)
 
         self.can_table.verticalHeader().hide()
         self.can_table.setHorizontalHeaderItem(0, QTableWidgetItem("ID"))
-        self.can_table.setColumnWidth(0,10)
-        for i in range(1,9):
-            item = QTableWidgetItem(str(i-1))
+        self.can_table.setHorizontalHeaderItem(1, QTableWidgetItem("ms"))
+        self.can_table.setHorizontalHeaderItem(2, QTableWidgetItem("#"))
+        for i in range(3,11):
+            item = QTableWidgetItem(str(i-3))
             self.can_table.setHorizontalHeaderItem(i, item)
-            self.can_table.setColumnWidth(i,10)
+        self.can_table.resizeColumnsToContents()
         
         sub.show()
 
@@ -212,14 +216,14 @@ class MDIWindow(QMainWindow):
             dbc_win = DBCRecvWindow(file_path, self)
             sub = QMdiSubWindow()
             sub.setWidget(dbc_win)
-            sub.setGeometry(100, 100, 500, 500)
+            sub.setGeometry(100, 100, 650, 800)
             self.mdi.addSubWindow(sub)
             sub.show()
 
             dbc_send_win = DBCSendWindow(file_path, self)
             sub2 = QMdiSubWindow()
             sub2.setWidget(dbc_send_win)
-            sub2.setGeometry(100, 100, 500, 500)
+            sub2.setGeometry(100, 100, 650, 800)
             self.mdi.addSubWindow(sub2)
             sub2.show()
 
@@ -285,24 +289,44 @@ class MDIWindow(QMainWindow):
         for file_name,window in self.dbc_windows.items():
             window.handleCANMessage(msg)
 
-        can_id_hex = msg.arbitration_id
-        can_id_printable = hex(can_id_hex)
-        
-        if can_id_hex not in self.can_data.keys():
-            self.can_data[can_id_hex] = self.can_row
-            can_id_item = QTableWidgetItem(can_id_printable)
-            self.can_table.setItem(self.can_row, 0, can_id_item)
-            row = self.can_row
-            self.can_row += 1
-        else:
-            row = self.can_data[can_id_hex]
+        self.can_data[msg.arbitration_id] = msg.data
 
-        for c in range(0,len(msg.data)):
-            item = QTableWidgetItem(hex(msg.data[c]))
-            self.can_table.setItem(row, c+1, item)
+        try:
+            rightnow = self.can_time_last[msg.arbitration_id]
+        except:
+            rightnow = time.time()
+        self.can_time_last[msg.arbitration_id] = time.time()   
+        self.can_times[msg.arbitration_id] = time.time() - rightnow
+
+        try:
+            self.can_count[msg.arbitration_id] += 1
+        except:
+            self.can_count[msg.arbitration_id] = 0
 
     def tick(self):
+        row_index = 0
+        for can_id_hex in self.can_data:
+            self.can_table.setItem(row_index, 0, QTableWidgetItem(hex(can_id_hex)))
+
+            try:
+                self.can_table.setItem(row_index, 1, QTableWidgetItem(str(round(self.can_times[can_id_hex]*1000, 0))))
+            except:
+                self.can_table.setItem(row_index, 1, QTableWidgetItem(""))
+
+            try:
+                self.can_table.setItem(row_index, 2, QTableWidgetItem(str(self.can_count[can_id_hex])))
+            except:
+                self.can_table.setItem(row_index, 2, QTableWidgetItem(""))
+            
+            data = self.can_data[can_id_hex]
+            for c in range(0,len(data)):
+                self.can_table.setItem(row_index, c+3, QTableWidgetItem(hex(data[c])))
+
+            row_index += 1
+        
         for file_name,window in self.dbc_send_windows.items():
+            window.tick()
+        for file_name,window in self.dbc_windows.items():
             window.tick()
 
 class DBCRecvWindow(QWidget):
@@ -311,8 +335,9 @@ class DBCRecvWindow(QWidget):
 
         self.file_name = os.path.basename(file_path)
         self.can_list_map = {}
+        self.messages = {}
         self.list_counter = 0
-        self.dbc = cantools.database.load_file(file_path, database_format='dbc', cache_dir=None)#file_name.split(".")[0])
+        self.dbc = cantools.database.load_file(file_path, database_format='dbc', cache_dir=None)
 
         self.setWindowTitle(self.file_name)
         layout = QBoxLayout(QBoxLayout.LeftToRight, parent=self)
@@ -321,10 +346,9 @@ class DBCRecvWindow(QWidget):
         self.list_recv = QListWidget()
         self.table_recv_ids = QTableWidget(len(self.dbc.messages), 2)
         self.table_recv_ids.verticalHeader().hide()
-        self.table_recv_ids.setColumnWidth(0,10)
-        self.table_recv_ids.setColumnWidth(1,10)
         self.table_recv_ids.setHorizontalHeaderItem(0, QTableWidgetItem("ID"))
         self.table_recv_ids.setHorizontalHeaderItem(1, QTableWidgetItem("Show"))
+        self.table_recv_ids.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
 
         layout.addWidget(self.table_recv_ids)
         layout.addWidget(self.list_recv)
@@ -349,44 +373,66 @@ class DBCRecvWindow(QWidget):
             
             i += 1
         self.table_recv_ids.sortItems(0, Qt.AscendingOrder)
+        self.table_recv_ids.resizeColumnsToContents()
 
     def handleCANMessage(self, msg):
-        display = False
-        for i in range(0,self.table_recv_ids.rowCount()):
-            #can_id = int(self.table_recv_ids.item(i, 0).text(),16)
-            can_id = int(self.table_recv_ids.cellWidget(i, 1).property('can_id'),16)
-            checked = self.table_recv_ids.cellWidget(i, 1).isChecked()
-            if msg.arbitration_id == can_id and checked == True:
-                display = True
         try:
             frame = self.dbc.decode_message(msg.arbitration_id, msg.data, decode_choices=True, scaling=True)
         except:
             return
 
-        frame_str = hex(msg.arbitration_id)+":\n"
-        for signal in frame:
-            if isinstance(frame[signal], str):
-                frame_str += signal + ": " + frame[signal] + "\n"
-            else:
-                try:
-                    frame_str += signal + ": " + "{:.2f}".format(frame[signal])+"\n"
-                except:
-                    frame_str += signal + ": " + str(frame[signal])+"\n"
-
         can_id = msg.arbitration_id
 
-        if can_id not in self.can_list_map.keys():
-            self.can_list_map[can_id] = self.list_counter
-            self.list_recv.addItem(QListWidgetItem(frame_str))
-            self.list_counter += 1
+        try:
+            message = self.messages[can_id]
+        except:
+            message = {}
+            message["id"] = can_id
+            message["signals"] = {}
+        
+        for signal in frame:
+            # to get units we need to get the message by id from the dbc and then find the signal
+            if isinstance(frame[signal], str):
+                message["signals"][signal] = frame[signal]
+            else:
+                try:
+                    message["signals"][signal] = "{:.2f}".format(frame[signal])
+                except:
+                    message["signals"][signal] = str(frame[signal])
 
-        list_id = self.can_list_map[can_id]
-        if display:
-            self.list_recv.item(list_id).setText(frame_str)
-            self.list_recv.item(list_id).setHidden(False)
-        else:
-            self.list_recv.item(list_id).setText("")
-            self.list_recv.item(list_id).setHidden(True)
+        self.messages[can_id] = message
+
+    def tick(self):
+        for message in self.messages:
+            this_can_id = self.messages[message]["id"]
+            
+            # Check if we are displaying this message
+            display = False
+            for i in range(0,self.table_recv_ids.rowCount()):
+                can_id = int(self.table_recv_ids.cellWidget(i, 1).property('can_id'),16)
+                if this_can_id != can_id:
+                    continue
+                checked = self.table_recv_ids.cellWidget(i, 1).isChecked()
+                if checked == True:
+                    display = True
+                    break
+
+            frame_str = ""
+            for signal in self.messages[message]["signals"]:
+                frame_str += signal+": "+self.messages[message]["signals"][signal]+"\n"
+
+            if this_can_id not in self.can_list_map.keys():
+                self.can_list_map[this_can_id] = self.list_counter
+                self.list_recv.addItem(QListWidgetItem(frame_str))
+                self.list_counter += 1
+
+            list_id = self.can_list_map[this_can_id]
+            if display:
+                self.list_recv.item(list_id).setText(frame_str)
+                self.list_recv.item(list_id).setHidden(False)
+            else:
+                self.list_recv.item(list_id).setText("")
+                self.list_recv.item(list_id).setHidden(True)
 
     def closeEvent(self, event):
         del self.parent.dbc_windows[self.file_name]
@@ -406,21 +452,17 @@ class DBCSendWindow(QWidget):
         self.setLayout(layout)
 
         self.table_send_data = QTableWidget(150,4)
+        self.table_send_data.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
         self.table_send_data.verticalHeader().hide()
-        self.table_send_data.setColumnWidth(0,10)
-        #self.table_send_data.setColumnWidth(1,50)
-        self.table_send_data.setColumnWidth(2,50)
-        #self.table_send_data.setColumnWidth(3,50)
         self.table_send_data.setHorizontalHeaderItem(0, QTableWidgetItem("ID"))
         self.table_send_data.setHorizontalHeaderItem(1, QTableWidgetItem("Signal"))
         self.table_send_data.setHorizontalHeaderItem(2, QTableWidgetItem("Unit"))
         self.table_send_data.setHorizontalHeaderItem(3, QTableWidgetItem("Data"))
+        self.table_send_data.resizeColumnsToContents()
 
         self.table_send_ids = QTableWidget(len(self.dbc.messages), 3)
+        self.table_send_ids.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
         self.table_send_ids.verticalHeader().hide()
-        self.table_send_ids.setColumnWidth(0,10)
-        self.table_send_ids.setColumnWidth(1,10)
-        self.table_send_ids.setColumnWidth(2,10)
         self.table_send_ids.setHorizontalHeaderItem(0, QTableWidgetItem("ID"))
         self.table_send_ids.setHorizontalHeaderItem(1, QTableWidgetItem("Show"))
         self.table_send_ids.setHorizontalHeaderItem(2, QTableWidgetItem("Xmit"))
@@ -452,6 +494,7 @@ class DBCSendWindow(QWidget):
             
             i += 1
         self.table_send_ids.sortItems(0, Qt.AscendingOrder)
+        self.table_send_ids.resizeColumnsToContents()
 
     def tick(self):
         for i in range(0,self.table_send_ids.rowCount()):
@@ -481,9 +524,12 @@ class DBCSendWindow(QWidget):
                 self.data_row_counter += 1
             
             self.can_list_counter += 1
+        self.table_send_data.resizeColumnsToContents()
 
     def sendMessage(self, send_can_id):
         dbc_msg = self.dbc.get_message_by_frame_id(send_can_id)
+
+        # Find all of our data value pairs for this message
         data = {}
         for i in range(0,self.table_send_data.rowCount()):
             if self.table_send_data.item(i, 0) == None:
@@ -493,10 +539,34 @@ class DBCSendWindow(QWidget):
                 continue
             signal = self.table_send_data.item(i, 1).text()
             value = self.table_send_data.item(i, 3).text()
-            data[signal] = int(value)
+            data[signal] = int(value) # TODO: can this be a float???
+
+        # Need to find multiplexer IDs so we only send data for a given multiplex!!!!
+        if dbc_msg.is_multiplexed():
+            data_to_send = {}
+            for signal in data:
+                found = False
+                for dbc_signal in dbc_msg.signal_tree:
+                    if isinstance(dbc_signal, str):
+                        if dbc_signal == signal:
+                            found = True
+                    else:
+                        # multiplexed
+                        for mult_signal in dbc_signal:
+                            if signal == mult_signal:
+                                found = True
+                            for mult_value in dbc_signal[mult_signal]:
+                                if mult_value == data[mult_signal]:
+                                    for signal_in_mult in dbc_signal[mult_signal][mult_value]:
+                                        if signal_in_mult == signal:
+                                            found = True
+                if found == True:
+                    data_to_send[signal] = data[signal]
+        else:
+            data_to_send = data
 
         try:
-            data_bytes = dbc_msg.encode(data,scaling=True,padding=False,strict=True)
+            data_bytes = dbc_msg.encode(data_to_send,scaling=True,padding=False,strict=True)
             msg = can.Message(arbitration_id=send_can_id, is_extended_id=dbc_msg.is_extended_frame, data=data_bytes)
         except:
             traceback.print_exc()
@@ -579,6 +649,19 @@ class CANConnection():
         self.bustype = bustype
         self.bitrate = bitrate
         self.path = path
+
+class CANSignal():
+    def __init__(self, name, units):
+        self.name = name
+        self.units = units
+        self.data = {}
+
+        # TODO: add multiplexors support here
+
+class CANMessage():
+    def __init__(self, can_id):
+        self.can_id = can_id
+        self.signals = {}
 
 app = QApplication(sys.argv)
 app.setWindowIcon(QIcon('icon.ico'))
