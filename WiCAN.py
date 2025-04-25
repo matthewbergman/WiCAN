@@ -135,9 +135,10 @@ class MDIWindow(QMainWindow):
         self.can_thread.can_status_signal.connect(self.handleCANStatus)
         self.can_thread.start()
 
+        self.tick_timer = 0
         timer = QTimer(self) 
         timer.timeout.connect(self.tick) 
-        timer.start(300)
+        timer.start(1)
 
     def createCANTableSubWindow(self):
         self.can_table = QTableWidget(50,11)
@@ -326,8 +327,12 @@ class MDIWindow(QMainWindow):
         
         for file_name,window in self.dbc_send_windows.items():
             window.tick()
-        for file_name,window in self.dbc_windows.items():
-            window.tick()
+
+        if self.tick_timer % 100 == 0:
+            for file_name,window in self.dbc_windows.items():
+                window.tick()
+
+        self.tick_timer += 1
 
 class DBCRecvWindow(QWidget):
     def __init__(self, file_path, parent):
@@ -344,6 +349,8 @@ class DBCRecvWindow(QWidget):
         self.setLayout(layout)
 
         self.list_recv = QListWidget()
+        self.list_recv.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
+        
         self.table_recv_ids = QTableWidget(len(self.dbc.messages), 2)
         self.table_recv_ids.verticalHeader().hide()
         self.table_recv_ids.setHorizontalHeaderItem(0, QTableWidgetItem("ID"))
@@ -351,9 +358,8 @@ class DBCRecvWindow(QWidget):
         self.table_recv_ids.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
 
         layout.addWidget(self.table_recv_ids)
+        layout.addStretch()
         layout.addWidget(self.list_recv)
-        layout.addWidget(self.table_recv_ids, 1)
-        layout.addWidget(self.list_recv, 3)
 
         self.parent = parent
         self.parent.dbc_windows[self.file_name] = self
@@ -496,12 +502,16 @@ class DBCSendWindow(QWidget):
         self.table_send_ids.sortItems(0, Qt.AscendingOrder)
         self.table_send_ids.resizeColumnsToContents()
 
+        self.tick_timer = 0
+
     def tick(self):
         for i in range(0,self.table_send_ids.rowCount()):
-            xmit = self.table_send_ids.cellWidget(i, 2).isChecked()
-            if xmit:
-                can_id = int(self.table_send_ids.cellWidget(i, 1).property('can_id'),16)
-                self.sendMessage(can_id)
+            if self.tick_timer % 30 == i % 30:
+                xmit = self.table_send_ids.cellWidget(i, 2).isChecked()
+                if xmit:
+                    can_id = int(self.table_send_ids.cellWidget(i, 1).property('can_id'),16)
+                    self.sendMessage(can_id)
+        self.tick_timer += 1
 
     def on_id_checkbox_change(self, checked):
         checkbox = self.sender()

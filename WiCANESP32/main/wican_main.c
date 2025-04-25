@@ -9,6 +9,8 @@ static const char *DEBUG_TAG = "WiCAN";
 #include <string.h>
 #include <stdbool.h>
 
+#include "driver/gpio.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -29,361 +31,57 @@ static const char *DEBUG_TAG = "WiCAN";
 
 // CAN
 #include "driver/gpio.h"
-#include "driver/can.h"
+#include "driver/twai.h"
 
-// BLE
-#include "ble_defs.h"
+// SD
+#include <sys/stat.h>
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
+#include "driver/sdmmc_host.h"
+
+// SD Card CS pin is GPIO2; SD.begin(2) SD Card MISO = GPIO19, MOSI = GPIO23
+#define PIN_NUM_MISO  19
+#define PIN_NUM_MOSI  23
+#define PIN_NUM_CLK   18
+#define PIN_NUM_CS    2
+
+#include "nmea2000.h"
 
 QueueHandle_t can_queue;
-
-#define BLE_BUF_SIZE 32
-unsigned char ble_buf[BLE_BUF_SIZE];
-void parse_ble_packet();
-uint32_t old_can_id = 0;
+QueueHandle_t logger_queue;
+volatile bool clear_log;
 
 bool have_valid_ip = false;
+uint8_t green_led_status = 0;
 
-/////////////////////////////////////////////////////////////////
-// BLE Functions
-/////////////////////////////////////////////////////////////////
-static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
+// Logged parameters
+typedef struct logger_params_t
 {
-    switch (event) 
-	{
-        case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
-            adv_config_done &= (~ADV_CONFIG_FLAG);
-            if (adv_config_done == 0)
-                esp_ble_gap_start_advertising(&adv_params);
-            break;
-        case ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT:
-            adv_config_done &= (~SCAN_RSP_CONFIG_FLAG);
-            if (adv_config_done == 0)
-                esp_ble_gap_start_advertising(&adv_params);
-            break;
-        case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
-            /* advertising start complete event to indicate advertising start successfully or failed */
-            if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS)
-                ESP_LOGE(DEBUG_TAG, "advertising start failed");
-            else
-                ESP_LOGI(DEBUG_TAG, "advertising start successfully");
-            break;
-        case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
-            if (param->adv_stop_cmpl.status != ESP_BT_STATUS_SUCCESS)
-                ESP_LOGE(DEBUG_TAG, "Advertising stop failed");
-            else
-                ESP_LOGI(DEBUG_TAG, "Stop adv successfully\n");
-            break;
-        case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
-            ESP_LOGI(DEBUG_TAG, "update connection params status = %d, min_int = %d, max_int = %d,conn_int = %d,latency = %d, timeout = %d",
-                  param->update_conn_params.status,
-                  param->update_conn_params.min_int,
-                  param->update_conn_params.max_int,
-                  param->update_conn_params.conn_int,
-                  param->update_conn_params.latency,
-                  param->update_conn_params.timeout);
-            break;
-        default:
-            break;
-    }
-}
+	float engine1_speed;
+	float engine2_speed;
+	float engine3_speed;
+	float engine4_speed;
+	uint8_t engine1_load_percent;
+	uint8_t engine2_load_percent;
+	uint8_t engine3_load_percent;
+	uint8_t engine4_load_percent;
+	uint8_t engine1_torque_percent;
+	uint8_t engine2_torque_percent;
+	uint8_t engine3_torque_percent;
+	uint8_t engine4_torque_percent;
+	float speed_over_ground;
+	uint32_t gps_date;
+	float gps_time;
+	float lat;
+	float lon;
+	float depth;
+	uint8_t temperature_instance;
+	uint8_t temperature_source;
+	float temperature;
+	uint32_t total_distance;
+} logger_params_t;
 
-static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
-{
-	esp_err_t set_dev_name_ret;
-	
-    switch (event) 
-	{
-        case ESP_GATTS_REG_EVT:
-            set_dev_name_ret = esp_ble_gap_set_device_name(ESP_DEVICE_NAME);
-            if (set_dev_name_ret)
-                ESP_LOGE(DEBUG_TAG, "set device name failed, error code = %x", set_dev_name_ret);
-            esp_err_t ret = esp_ble_gap_config_adv_data(&adv_data);
-            if (ret)
-                ESP_LOGE(DEBUG_TAG, "config adv data failed, error code = %x", ret);
-            adv_config_done |= ADV_CONFIG_FLAG;
-            //config scan response data
-            ret = esp_ble_gap_config_adv_data(&scan_rsp_data);
-            if (ret)
-                ESP_LOGE(DEBUG_TAG, "config scan response data failed, error code = %x", ret);
-            adv_config_done |= SCAN_RSP_CONFIG_FLAG;
-            esp_err_t create_attr_ret = esp_ble_gatts_create_attr_tab(gatt_db, gatts_if, HRS_IDX_NB, SVC_INST_ID);
-            if (create_attr_ret)
-                ESP_LOGE(DEBUG_TAG, "create attr table failed, error code = %x", create_attr_ret);
-       	    break;
-        case ESP_GATTS_READ_EVT:
-            ESP_LOGI(DEBUG_TAG, "ESP_GATTS_READ_EVT");
-       	    break;
-        case ESP_GATTS_WRITE_EVT:
-            if (!param->write.is_prep) 
-			{
-                // the data length of gattc write  must be less than CHAR_VAL_LEN_MAX.
-                ESP_LOGI(DEBUG_TAG, "GATT_WRITE_EVT, handle = %d, value len = %d", param->write.handle, param->write.len);
-                esp_log_buffer_hex(DEBUG_TAG, param->write.value, param->write.len);
-				
-                if (ble_handle_table[IDX_CHAR_CFG_CAN] == param->write.handle) 
-				{
-					if (param->write.len == 2) 
-					{
-						uint16_t descr_value = param->write.value[1]<<8 | param->write.value[0];
-						char_can_notify_enabled = false;
-						if (descr_value == 0x0001)
-						{
-							char_can_notify_enabled = true;
-							ESP_LOGI(DEBUG_TAG, "bms notify enable");
-							
-							uint8_t indicate_data[15];
-							for (int i = 0; i < sizeof(indicate_data); ++i)
-								indicate_data[i] = 0;
-							//the size of indicate_data[] need less than MTU size
-							esp_ble_gatts_send_indicate(gatts_if, param->write.conn_id, ble_handle_table[IDX_CHAR_VAL_CAN],
-												sizeof(indicate_data), indicate_data, false);
-						}
-						else if (descr_value == 0x0002)
-						{
-							ESP_LOGI(DEBUG_TAG, "bms indicate enable");
-							
-							uint8_t indicate_data[15];
-							for (int i = 0; i < sizeof(indicate_data); ++i)
-								indicate_data[i] = 0;
-							//the size of indicate_data[] need less than MTU size
-							esp_ble_gatts_send_indicate(gatts_if, param->write.conn_id, ble_handle_table[IDX_CHAR_VAL_CAN],
-												sizeof(indicate_data), indicate_data, true);
-						}
-						else if (descr_value == 0x0000)
-						{
-							ESP_LOGI(DEBUG_TAG, "bms notify/indicate disable ");
-						}
-						else
-						{
-							ESP_LOGE(DEBUG_TAG, "bms unknown descr value");
-							esp_log_buffer_hex(DEBUG_TAG, param->write.value, param->write.len);
-						}
-					} 
-					else 
-					{
-						
-					}
-				}
-				if (ble_handle_table[IDX_CHAR_VAL_CAN] == param->write.handle) 
-				{
-					// regular data, parse it as a command from the client app
-					printf("BLE packet from the APP, pass to CAN bus\n");
-					esp_log_buffer_hex(DEBUG_TAG, param->write.value, param->write.len);
-					
-					if (param->write.len > 5)
-					{
-						memset(ble_buf, 0, BLE_BUF_SIZE);
-						for (int i=0; i<param->write.len; i++)
-							ble_buf[i] = param->write.value[i];
-							
-						parse_ble_packet();
-					}
-				}
-				else 
-				{
-					printf("CHAR_CAN %d\n", ble_handle_table[IDX_CHAR_CAN]);
-					printf("CHAR_VAL_CAN %d\n", ble_handle_table[IDX_CHAR_VAL_CAN]);
-					printf("CHAR_CFG_CAN %d\n", ble_handle_table[IDX_CHAR_CFG_CAN]);
-					
-					printf("Unknown write.handle\n");
-				}
-				
-                /* send response when param->write.need_rsp is true*/
-                if (param->write.need_rsp)
-                    esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
-            }
-			else
-                printf("BLE PREPARE WRITES NOT SUPPORTED!\n");
-      	    break;
-        case ESP_GATTS_EXEC_WRITE_EVT: 
-            // the length of gattc prapare write data must be less than CHAR_VAL_LEN_MAX. 
-            ESP_LOGI(DEBUG_TAG, "ESP_GATTS_EXEC_WRITE_EVT NOT SUPPORTED");
-            break;
-        case ESP_GATTS_MTU_EVT:
-            ESP_LOGI(DEBUG_TAG, "ESP_GATTS_MTU_EVT, MTU %d", param->mtu.mtu);
-            break;
-        case ESP_GATTS_CONF_EVT:
-			// WHY are we getting these?
-            //ESP_LOGI(DEBUG_TAG, "ESP_GATTS_CONF_EVT, status = %d, attr_handle %d", param->conf.status, param->conf.handle);
-            break;
-        case ESP_GATTS_START_EVT:
-            ESP_LOGI(DEBUG_TAG, "SERVICE_START_EVT, status %d, service_handle %d", param->start.status, param->start.service_handle);
-            break;
-        case ESP_GATTS_CONNECT_EVT:
-            ESP_LOGI(DEBUG_TAG, "ESP_GATTS_CONNECT_EVT, conn_id = %d", param->connect.conn_id);
-            esp_log_buffer_hex(DEBUG_TAG, param->connect.remote_bda, 6);
-            esp_ble_conn_update_params_t conn_params = {0};
-            memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
-            /* For the iOS system, please refer to Apple official documents about the BLE connection parameters restrictions. */
-            conn_params.latency = 0;
-            conn_params.max_int = 0x20;    // max_int = 0x20*1.25ms = 40ms
-            conn_params.min_int = 0x10;    // min_int = 0x10*1.25ms = 20ms
-            conn_params.timeout = 400;    // timeout = 400*10ms = 4000ms
-            //start sent the update connection parameters to the peer device.
-            esp_ble_gap_update_conn_params(&conn_params);
-			
-			spp_conn_id = param->connect.conn_id;
-    	    spp_gatts_if = gatts_if;
-            break;
-        case ESP_GATTS_DISCONNECT_EVT:
-            ESP_LOGI(DEBUG_TAG, "ESP_GATTS_DISCONNECT_EVT, reason = 0x%x", param->disconnect.reason);
-            esp_ble_gap_start_advertising(&adv_params);
-			char_can_notify_enabled = false;
-            break;
-        case ESP_GATTS_CREAT_ATTR_TAB_EVT:
-            if (param->add_attr_tab.status != ESP_GATT_OK)
-                ESP_LOGE(DEBUG_TAG, "create attribute table failed, error code=0x%x", param->add_attr_tab.status);
-            else if (param->add_attr_tab.num_handle != HRS_IDX_NB)
-			{
-                ESP_LOGE(DEBUG_TAG, "create attribute table abnormally, num_handle (%d) \
-                        doesn't equal to HRS_IDX_NB(%d)", param->add_attr_tab.num_handle, HRS_IDX_NB);
-            }
-            else 
-			{
-                ESP_LOGI(DEBUG_TAG, "create attribute table successfully, the number handle = %d\n",param->add_attr_tab.num_handle);
-                memcpy(ble_handle_table, param->add_attr_tab.handles, sizeof(ble_handle_table));
-                esp_ble_gatts_start_service(ble_handle_table[IDX_SVC]);
-            }
-            break;
-        case ESP_GATTS_STOP_EVT:
-        case ESP_GATTS_OPEN_EVT:
-        case ESP_GATTS_CANCEL_OPEN_EVT:
-        case ESP_GATTS_CLOSE_EVT:
-        case ESP_GATTS_LISTEN_EVT:
-        case ESP_GATTS_CONGEST_EVT:
-        case ESP_GATTS_UNREG_EVT:
-        case ESP_GATTS_DELETE_EVT:
-        default:
-            break;
-    }
-}
 
-void parse_ble_packet()
-{
-	uint32_t id;
-	uint8_t data_len;
-	can_message_t message;
-	
-	if (ble_buf[0] != 0xAA)
-		return;
-		
-	data_len = ble_buf[5];
-	
-	if (data_len > 8)
-	{
-		ESP_LOGI(DEBUG_TAG, "Bad length: %d", data_len);
-		return;
-	}
-	
-	if (ble_buf[10 + data_len] != 0xBB)
-	{
-		ESP_LOGI(DEBUG_TAG, "Bad check byte: %d", ble_buf[10 + data_len]);
-		return;
-	}
-	
-	id = ble_buf[6];
-	id |= (uint32_t)ble_buf[7] << 8;
-	id |= (uint32_t)ble_buf[8] << 16;
-	id |= (uint32_t)ble_buf[9] << 24;
-	
-	
-	message.identifier = id;
-	if (id > 0x7FF)
-		message.flags = CAN_MSG_FLAG_EXTD;	// TODO: this should be explicit
-		
-	message.data_length_code = data_len;
-	for (int i = 0; i < data_len; i++) {
-		message.data[i] = ble_buf[10+i];
-	}
-
-	//Queue message for transmission
-	if (can_transmit(&message, pdMS_TO_TICKS(100)) == ESP_OK) {
-		printf("Message queued for transmission\n");
-	} else {
-		printf("Failed to queue message for transmission\n");
-	}
-}
-
-static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
-{
-    /* If event is register event, store the gatts_if for each profile */
-    if (event == ESP_GATTS_REG_EVT) 
-	{
-        if (param->reg.status == ESP_GATT_OK) 
-		{
-            ble_profile_tab[PROFILE_APP_IDX].gatts_if = gatts_if;
-        } 
-		else 
-		{
-            ESP_LOGE(DEBUG_TAG, "reg app failed, app_id %04x, status %d",
-                    param->reg.app_id,
-                    param->reg.status);
-            return;
-        }
-    }
-	
-	int idx;
-	for (idx = 0; idx < PROFILE_NUM; idx++) 
-	{
-		/* ESP_GATT_IF_NONE, not specify a certain gatt_if, need to call every profile cb function */
-		if (gatts_if == ESP_GATT_IF_NONE || gatts_if == ble_profile_tab[idx].gatts_if) 
-		{
-			if (ble_profile_tab[idx].gatts_cb) 
-			{
-				ble_profile_tab[idx].gatts_cb(event, gatts_if, param);
-			}
-		}
-	}
-}
-
-void task_BLE(void *pvParameters)
-{	
-	can_message_t message;
-	char buffer[19];
-	uint32_t msecs;
-	
-	while (1)
-	{
-		if (!char_can_notify_enabled)
-		{
-			vTaskDelay(1000 / portTICK_PERIOD_MS);
-			continue;
-		}
-		
-		if (can_queue != NULL && xQueueReceive(can_queue, &message, 1))
-		{
-			msecs = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-			buffer[0] = 0xAA;
-			buffer[1] = msecs;
-			buffer[2] = msecs >> 8;
-			buffer[3] = msecs >> 16;
-			buffer[4] = msecs >> 24;
-			buffer[5] = message.data_length_code;
-			buffer[6] = message.identifier;
-			buffer[7] = message.identifier >> 8;
-			buffer[8] = message.identifier >> 16;
-			buffer[9] = message.identifier >> 24;
-			for (int i=0; i < message.data_length_code; i++)
-				buffer[10+i] = message.data[i];
-			buffer[10+message.data_length_code] = 0xBB;
-			
-			// TODO: this should be notify! We don't need a response.
-			esp_ble_gatts_send_indicate(
-				spp_gatts_if, 
-				spp_conn_id, 
-				ble_handle_table[IDX_CHAR_VAL_CAN], 
-				11+message.data_length_code,
-				(uint8_t*)&buffer, 
-				false);
-				
-			if (message.identifier == 0x101)
-				ESP_LOGE(DEBUG_TAG, "Sending 0x101\n");
-				
-			old_can_id = 0;
-		}
-		//vTaskDelay(5 / portTICK_PERIOD_MS);
-	}
-}
 
 /////////////////////////////////////////////////////////////////
 // CAN Functions
@@ -391,45 +89,322 @@ void task_BLE(void *pvParameters)
 
 void task_CAN(void *pvParameters)
 {	
-	can_message_t message;
+	twai_message_t message;
+	logger_params_t logged;
+	uint32_t pgn;
+	
+	uint32_t gnss_pos_data_id = 0;
+	uint8_t gnss_pos_data_buf[52];
+	uint8_t gnss_pos_data_len = 0;
+	
+	uint32_t engine_data_id = 0;
+	uint8_t engine_data_buf[52];
+	uint8_t engine_data_len = 0;
+	
+	uint32_t distance_log_id = 0;
+	uint8_t distance_log_buf[15];
+	uint8_t distance_log_len = 0;
+	
+	logged.engine1_speed = 0;
+	logged.engine2_speed = 0;
+	logged.engine3_speed = 0;
+	logged.engine4_speed = 0;
+	logged.engine1_load_percent = 0;
+	logged.engine2_load_percent = 0;
+	logged.engine3_load_percent = 0;
+	logged.engine4_load_percent = 0;
+	logged.engine1_torque_percent = 0;
+	logged.engine2_torque_percent = 0;
+	logged.engine3_torque_percent = 0;
+	logged.engine4_torque_percent = 0;
+	logged.speed_over_ground = 0;
+	logged.gps_date = 0;
+	logged.gps_time = 0;
+	logged.lat = 0;
+	logged.lon = 0;
+	logged.depth = 0;
+	logged.temperature_instance = 0;
+	logged.temperature_source = 0;
+	logged.temperature = 0;
+	logged.total_distance = 0;
+	
     while (1)
 	{
         //Wait for message to be received
-		if (can_receive(&message, pdMS_TO_TICKS(10000)) != ESP_OK) 
+		if (twai_receive(&message, pdMS_TO_TICKS(1000)) != ESP_OK) 
 		{
 			ESP_LOGE(DEBUG_TAG, "Failed to receive message\n");
 			continue;
 		}
 		
-		if (!(message.flags & CAN_MSG_FLAG_RTR)) 
+		ESP_LOGI(DEBUG_TAG, "Receive message\n");
+		
+		if (!(message.rtr) || true)
 		{
+			// Put the packet in the queue for the TCP thread
 			if (can_queue != NULL)
 			{
-				/*
-				if (uxQueueSpacesAvailable(can_queue) == 0)
+				//ESP_LOGI(DEBUG_TAG, "Receive message\n");
+				if (uxQueueSpacesAvailable(can_queue) > 5)
+					xQueueSend(can_queue, &message, pdMS_TO_TICKS(1));
+			}
+			
+			pgn = (message.identifier >> 8) & 0x3FFFF;
+			//printf("pgn: %x\n", pgn);
+			
+			// Engine Parameters Rapid Update 0x19F200FE
+			if (pgn == 0x1F200)
+			{
+				struct nmea2000_engine_parameters_rapid_update_t engine;
+				
+				nmea2000_engine_parameters_rapid_update_unpack(&engine, message.data, NMEA2000_ENGINE_PARAMETERS_RAPID_UPDATE_LENGTH);
+
+				if (engine.engine_instance == 0)
+					logged.engine1_speed = nmea2000_engine_parameters_rapid_update_engine_speed_decode(engine.engine_speed);
+				else if (engine.engine_instance == 1)
+					logged.engine2_speed = nmea2000_engine_parameters_rapid_update_engine_speed_decode(engine.engine_speed);
+				else if (engine.engine_instance == 2)
+					logged.engine3_speed = nmea2000_engine_parameters_rapid_update_engine_speed_decode(engine.engine_speed);
+				else if (engine.engine_instance == 3)
+					logged.engine4_speed = nmea2000_engine_parameters_rapid_update_engine_speed_decode(engine.engine_speed);
+				else
+					continue; // only support 4 engines
+				
+				xQueueOverwrite(logger_queue, &logged);
+			}
+			
+			// EngineParametersDynamic 0x19F201FE
+			if (pgn == 0x1F201)
+			{
+				bool done = false;
+				
+				// Make sure we are reassembling the packet from the same sender
+				if (engine_data_id != 0 && engine_data_id != message.identifier)
+					continue;
+				
+				uint8_t seq = message.data[0] & 0x0F;
+				
+				if (seq == 0)
 				{
-					if (old_can_id != 0x101)
+					engine_data_id = message.identifier;
+					engine_data_len = message.data[1];
+					
+					engine_data_buf[0] = message.data[2];
+					engine_data_buf[1] = message.data[3];
+					engine_data_buf[2] = message.data[4];
+					engine_data_buf[3] = message.data[5];
+					engine_data_buf[4] = message.data[6];
+					engine_data_buf[5] = message.data[7];
+				}
+				else if (engine_data_len > 0)
+				{
+					uint8_t offset = 6 + ((seq - 1) * 7);
+					
+					int i;
+					for (i=0; i<6; i++)
 					{
-						// Queue is full but the item isn't important, overwrite
-						old_can_id = message.identifier;
-						xQueueOverwrite(can_queue, &message);
+						engine_data_buf[offset] = message.data[i+1];
+						offset++;
+						if (offset > engine_data_len)
+						{
+							done = true;
+							engine_data_id = 0;
+							break;
+						}
+					}
+				}
+				
+				if (done)
+				{
+					struct nmea2000_engine_parameters_dynamic_t engine;
+					
+					nmea2000_engine_parameters_dynamic_unpack(&engine, engine_data_buf, NMEA2000_ENGINE_PARAMETERS_DYNAMIC_LENGTH);
+					
+					if (engine.engine_instance == 0)
+					{
+						logged.engine1_load_percent = nmea2000_engine_parameters_dynamic_percent_engine_load_decode(engine.percent_engine_load);
+						logged.engine1_torque_percent = nmea2000_engine_parameters_dynamic_percent_engine_load_decode(engine.percent_engine_torque);
+					}
+					else if (engine.engine_instance == 1)
+					{
+						logged.engine2_load_percent = nmea2000_engine_parameters_dynamic_percent_engine_load_decode(engine.percent_engine_load);
+						logged.engine2_torque_percent = nmea2000_engine_parameters_dynamic_percent_engine_load_decode(engine.percent_engine_torque);
+					}
+					else if (engine.engine_instance == 2)
+					{
+						logged.engine3_load_percent = nmea2000_engine_parameters_dynamic_percent_engine_load_decode(engine.percent_engine_load);
+						logged.engine3_torque_percent = nmea2000_engine_parameters_dynamic_percent_engine_load_decode(engine.percent_engine_torque);
+					}
+					else if (engine.engine_instance == 3)
+					{
+						logged.engine4_load_percent = nmea2000_engine_parameters_dynamic_percent_engine_load_decode(engine.percent_engine_load);
+						logged.engine4_torque_percent = nmea2000_engine_parameters_dynamic_percent_engine_load_decode(engine.percent_engine_torque);
 					}
 					else
+						continue; // only 4 engines
+					
+					xQueueOverwrite(logger_queue, &logged);
+				}
+			}
+			
+			//COGSSOGRapidUpdate 0x09F802
+			if (pgn == 0x1F802)
+			{
+				struct nmea2000_cogsog_rapid_update_t cog_sog;
+				
+				nmea2000_cogsog_rapid_update_unpack(&cog_sog, message.data, NMEA2000_COGSOG_RAPID_UPDATE_LENGTH);
+
+				logged.speed_over_ground = nmea2000_cogsog_rapid_update_speed_over_ground_decode(cog_sog.speed_over_ground);
+				
+				xQueueOverwrite(logger_queue, &logged);
+			}
+			
+			//WaterDepth 0x19F50BFE
+			if (pgn == 0x1F50B)
+			{
+				struct nmea2000_water_depth_t water_depth;
+				
+				nmea2000_water_depth_unpack(&water_depth, message.data, NMEA2000_WATER_DEPTH_LENGTH);
+
+				float max_depth_m = nmea2000_water_depth_maximum_depth_range_decode(water_depth.maximum_depth_range);
+				float offset_m = nmea2000_water_depth_offset_decode(water_depth.offset);
+				float depth_at_transducer_m = nmea2000_water_depth_water_depth_transducer_decode(water_depth.water_depth_transducer);
+				
+				depth_at_transducer_m += offset_m;
+				
+				if (water_depth.maximum_depth_range < 253)
+				{
+					if (max_depth_m < depth_at_transducer_m)
+						depth_at_transducer_m = max_depth_m;
+				}
+				
+				logged.depth = depth_at_transducer_m;
+				
+				xQueueOverwrite(logger_queue, &logged);
+			}
+			
+			// TemperatureExtendedRange 0x19FD0CFE
+			if (pgn == 0x1FD0C)
+			{
+				struct nmea2000_temperature_extended_range_t temp;
+				
+				nmea2000_temperature_extended_range_unpack(&temp, message.data, NMEA2000_TEMPERATURE_EXTENDED_RANGE_LENGTH);
+
+				logged.temperature_instance = temp.temperature_instance;
+				logged.temperature_source = temp.temperature_source;
+				logged.temperature = nmea2000_temperature_extended_range_actual_temperature_decode(temp.actual_temperature)-273;
+				
+				xQueueOverwrite(logger_queue, &logged);
+			}
+			
+			
+			//GNSSPositionData 0x0DF805
+			if (pgn == 0x1F805)
+			{
+				bool done = false;
+				
+				// Make sure we are reassembling the packet from the same sender
+				if (gnss_pos_data_id != 0 && gnss_pos_data_id != message.identifier)
+					continue;
+				
+				uint8_t seq = message.data[0] & 0x0F;
+				
+				if (seq == 0)
+				{
+					gnss_pos_data_id = message.identifier;
+					gnss_pos_data_len = message.data[1];
+					
+					gnss_pos_data_buf[0] = message.data[2];
+					gnss_pos_data_buf[1] = message.data[3];
+					gnss_pos_data_buf[2] = message.data[4];
+					gnss_pos_data_buf[3] = message.data[5];
+					gnss_pos_data_buf[4] = message.data[6];
+					gnss_pos_data_buf[5] = message.data[7];
+				}
+				else if (gnss_pos_data_len > 0)
+				{
+					uint8_t offset = 6 + ((seq - 1) * 7);
+					
+					int i;
+					for (i=0; i<6; i++)
 					{
-						//ESP_LOGE(DEBUG_TAG, "Didn't overwrite 0x101 in queue\n");
+						gnss_pos_data_buf[offset] = message.data[i+1];
+						offset++;
+						if (offset > gnss_pos_data_len)
+						{
+							done = true;
+							gnss_pos_data_id = 0;
+							break;
+						}
 					}
 				}
-				else
-				{
-					// Space in the queue
-					old_can_id = message.identifier;
-					xQueueOverwrite(can_queue, &message);
-				}
-				*/
 				
-				// TODO: clumsy attempt at priority messages
-				if (uxQueueSpacesAvailable(can_queue) > 5 || message.identifier == 0x101)
-					xQueueSend(can_queue, &message, pdMS_TO_TICKS(1));
+				if (done)
+				{
+					struct nmea2000_gnss_position_data_t gnss;
+					
+					nmea2000_gnss_position_data_unpack(&gnss, gnss_pos_data_buf, NMEA2000_GNSS_POSITION_DATA_LENGTH);
+
+					logged.gps_date = gnss.position_date;
+					logged.gps_time = nmea2000_gnss_position_data_position_time_decode(gnss.position_time);
+					logged.lat = nmea2000_gnss_position_data_latitude_decode(gnss.latitude);
+					logged.lon = nmea2000_gnss_position_data_longitude_decode(gnss.longitude);
+					
+					xQueueOverwrite(logger_queue, &logged);
+				}
+			}
+			
+			//DistanceLog 0x19F513FE
+			if (pgn == 0x1F513)
+			{
+				bool done = false;
+				
+				// Make sure we are reassembling the packet from the same sender
+				if (distance_log_id != 0 && distance_log_id != message.identifier)
+					continue;
+				
+				uint8_t seq = message.data[0] & 0x0F;
+				
+				if (seq == 0)
+				{
+					distance_log_id = message.identifier;
+					distance_log_len = message.data[1];
+					
+					distance_log_buf[0] = message.data[2];
+					distance_log_buf[1] = message.data[3];
+					distance_log_buf[2] = message.data[4];
+					distance_log_buf[3] = message.data[5];
+					distance_log_buf[4] = message.data[6];
+					distance_log_buf[5] = message.data[7];
+				}
+				else if (distance_log_len > 0)
+				{
+					uint8_t offset = 6 + ((seq - 1) * 7);
+					
+					int i;
+					for (i=0; i<6; i++)
+					{
+						distance_log_buf[offset] = message.data[i+1];
+						offset++;
+						if (offset > distance_log_len)
+						{
+							done = true;
+							distance_log_id = 0;
+							break;
+						}
+					}
+				}
+				
+				if (done)
+				{
+					struct nmea2000_distance_log_t dist;
+					
+					nmea2000_distance_log_unpack(&dist, distance_log_buf, NMEA2000_DISTANCE_LOG_LENGTH);
+
+					logged.total_distance = dist.total_cumulative_distance;
+					
+					xQueueOverwrite(logger_queue, &logged);
+				}
 			}
 		}
 		//vTaskDelay(5 / portTICK_PERIOD_MS);
@@ -449,8 +424,8 @@ void cb_connection_ok(void *pvParameter)
         printf("MDNS Init failed: %d\n", err);
 	else
 	{
-		mdns_hostname_set("wican");
-		mdns_instance_name_set("WiCAN Adapter");
+		mdns_hostname_set("photon");
+		mdns_instance_name_set("Photon Logger");
 	}
 	
 	have_valid_ip = true;
@@ -513,7 +488,7 @@ static void tcp_server_task(void *pvParameters)
 		
 		inet_ntoa_r(((struct sockaddr_in *)&source_addr)->sin_addr.s_addr, addr_str, sizeof(addr_str) - 1);
 		
-		can_message_t message;
+		twai_message_t message;
 		char buffer[19];
 		uint32_t msecs;
 		while (1)
@@ -556,53 +531,188 @@ static void tcp_server_task(void *pvParameters)
 	vTaskDelete(NULL);
 }
 
+/////////////////////////////////////////////////////////////////
+// Logger Functions
+/////////////////////////////////////////////////////////////////
+
+void logger_task(void *pvParameters)
+{
+	logger_params_t logged;
+	esp_err_t ret;
+	const char *file_hello = "/sdcard/log.csv";
+	FILE *f = NULL;
+	
+	ESP_LOGI(DEBUG_TAG, "Starting logger thread");
+
+	esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+		.format_if_mount_failed = false,
+		.max_files = 5,
+		.allocation_unit_size = 16 * 1024
+	};
+	sdmmc_card_t *card;
+	const char mount_point[] = "/sdcard";
+	ESP_LOGI(DEBUG_TAG, "Initializing SD card");
+	
+	
+	/*
+	ESP_LOGI(DEBUG_TAG, "Using SPI peripheral");
+
+	sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+	spi_bus_config_t bus_cfg = {
+		.mosi_io_num = PIN_NUM_MOSI,
+		.miso_io_num = PIN_NUM_MISO,
+		.sclk_io_num = PIN_NUM_CLK,
+		.quadwp_io_num = -1,
+		.quadhd_io_num = -1,
+		.max_transfer_sz = 4000,
+	};
+	ret = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
+	if (ret != ESP_OK) 
+	{
+		ESP_LOGE(DEBUG_TAG, "Failed to initialize bus.");
+		while(1) {vTaskDelay(500 / portTICK_PERIOD_MS);}
+	}
+
+	// This initializes the slot without card detect (CD) and write protect (WP) signals.
+	// Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
+	sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+	slot_config.gpio_cs = PIN_NUM_CS;
+	slot_config.host_id = host.slot;
+	*/
+	
+	
+	
+	
+	
+	ESP_LOGI(DEBUG_TAG, "Using SDMMC peripheral");
+
+    // By default, SD card frequency is initialized to SDMMC_FREQ_DEFAULT (20MHz)
+    // For setting a specific frequency, use host.max_freq_khz (range 400kHz - 40MHz for SDMMC)
+    // Example: for fixed frequency of 10MHz, use host.max_freq_khz = 10000;
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+
+    // This initializes the slot without card detect (CD) and write protect (WP) signals.
+    // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
+	#define SOC_SDMMC_USE_GPIO_MATRIX true
+    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot_config.width = 4;
+
+    // Enable internal pullups on enabled pins. The internal pullups
+    // are insufficient however, please make sure 10k external pullups are
+    // connected on the bus. This is for debug / example purpose only.
+    slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+	
+	
+	
+	
+	
+
+	ESP_LOGI(DEBUG_TAG, "Mounting filesystem");
+	ret = esp_vfs_fat_sdmmc_mount(mount_point, &host, &slot_config, &mount_config, &card);
+
+	if (ret != ESP_OK) 
+	{
+		if (ret == ESP_FAIL) 
+		{
+			ESP_LOGE(DEBUG_TAG, "Failed to mount filesystem.");
+		} 
+		else 
+		{
+			ESP_LOGE(DEBUG_TAG, "Failed to initialize the card (%s).", esp_err_to_name(ret));
+		}
+		while(1) {vTaskDelay(500 / portTICK_PERIOD_MS);}
+	}
+	ESP_LOGI(DEBUG_TAG, "Filesystem mounted");
+
+	// Card has been initialized, print its properties
+	sdmmc_card_print_info(stdout, card);
+		
+	while (1)
+	{
+		// Open the file
+		ESP_LOGI(DEBUG_TAG, "Opening file %s", file_hello);
+		f = fopen(file_hello, "a");
+		if (f == NULL) 
+		{
+			ESP_LOGE(DEBUG_TAG, "Failed to open file for writing");
+			while(1) {vTaskDelay(500 / portTICK_PERIOD_MS);}
+		}
+	
+		while (1)
+		{
+			if (logger_queue != NULL && xQueueReceive(logger_queue, &logged, pdMS_TO_TICKS(10)))
+			{
+				// Get latest data
+			}
+			
+			// date, time, lat, lon, speed, rpm
+			if (f != NULL)
+			{
+				fprintf(f, "%i,%f,%f,%f,%f,%ul,%f,%f,%f,%f,%i,%i,%i,%i,%i,%i,%i,%i,%f,%i:%i:%f\n", 
+					logged.gps_date, 
+					logged.gps_time, 
+					logged.lat, 
+					logged.lon, 
+					logged.speed_over_ground, 
+					logged.total_distance,
+					logged.engine1_speed,
+					logged.engine2_speed,
+					logged.engine3_speed,
+					logged.engine4_speed,
+					logged.engine1_load_percent,
+					logged.engine2_load_percent,
+					logged.engine3_load_percent,
+					logged.engine4_load_percent,
+					logged.engine1_torque_percent,
+					logged.engine2_torque_percent,
+					logged.engine3_torque_percent,
+					logged.engine4_torque_percent,
+					logged.depth,
+					logged.temperature_instance,
+					logged.temperature_source,
+					logged.temperature
+					);
+				
+				
+				fflush(f);
+				fsync(fileno(f));
+			}
+			
+			if (clear_log)
+			{
+				fclose(f);
+				f = fopen(file_hello, "w");
+				fflush(f);
+				fsync(fileno(f));
+				fclose(f);
+				
+				clear_log = false;
+				
+				break;
+			}
+			
+			green_led_status = 1 - green_led_status;
+			gpio_set_level(GPIO_NUM_16, green_led_status);
+			
+			vTaskDelay(500 / portTICK_PERIOD_MS);
+		}
+	}
+}
+
+/////////////////////////////////////////////////////////////////
+// Main
+/////////////////////////////////////////////////////////////////
+
 void app_main()
 {
 	esp_err_t ret;
 	
-	// Queue length must be 1 for the overwrite function
-	//can_queue = xQueueCreate(1, sizeof(can_message_t));
-	can_queue = xQueueCreate(10, sizeof(can_message_t));
+	can_queue = xQueueCreate(10, sizeof(twai_message_t));
+	logger_queue = xQueueCreate(1, sizeof(logger_params_t));
 	
 	// Setup wifi manager to manage saved SSIDs
-	wifi_manager_start();
-	wifi_manager_set_callback(WM_EVENT_STA_GOT_IP, &cb_connection_ok);
-	
-	// Start BLE
-	adv_data.set_scan_rsp        = false;
-    adv_data.include_name        = true;
-    adv_data.include_txpower     = true;
-    adv_data.min_interval        = 0x0006; //slave connection min interval, Time = min_interval * 1.25 msec
-    adv_data.max_interval        = 0x0010; //slave connection max interval, Time = max_interval * 1.25 msec
-    adv_data.appearance          = 0x00;
-    adv_data.manufacturer_len    = 7;
-    adv_data.p_manufacturer_data = &manufacturer[0];
-    adv_data.service_data_len    = 0;
-    adv_data.p_service_data      = NULL;
-    adv_data.service_uuid_len    = sizeof(service_uuid);
-    adv_data.p_service_uuid      = service_uuid;
-    adv_data.flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
-	
-	scan_rsp_data.set_scan_rsp        = true;
-    scan_rsp_data.include_name        = true;
-    scan_rsp_data.include_txpower     = true;
-    scan_rsp_data.min_interval        = 0x0006;
-    scan_rsp_data.max_interval        = 0x0010;
-    scan_rsp_data.appearance          = 0x00;
-    scan_rsp_data.manufacturer_len    = 7;
-    scan_rsp_data.p_manufacturer_data = &manufacturer[0];
-    scan_rsp_data.service_data_len    = 0;
-    scan_rsp_data.p_service_data      = NULL;
-    scan_rsp_data.service_uuid_len    = sizeof(service_uuid);
-    scan_rsp_data.p_service_uuid      = service_uuid;
-    scan_rsp_data.flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
-	
-	adv_params.adv_int_min         = 0x20;
-    adv_params.adv_int_max         = 0x40;
-    adv_params.adv_type            = ADV_TYPE_IND;
-    adv_params.own_addr_type       = BLE_ADDR_TYPE_PUBLIC;
-    adv_params.channel_map         = ADV_CHNL_ALL;
-    adv_params.adv_filter_policy   = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
+	//wifi_manager_start();
+	//wifi_manager_set_callback(WM_EVENT_STA_GOT_IP, &cb_connection_ok);
 	
     // Initialize NVS.
     ret = nvs_flash_init();
@@ -613,68 +723,39 @@ void app_main()
     }
     ESP_ERROR_CHECK(ret);
 	
-	
-	esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    ret = esp_bt_controller_init(&bt_cfg);
-    if (ret) 
-        ESP_LOGE(DEBUG_TAG, "%s initialize controller failed\n", __func__);
-
-	if (!ret)
-		ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
-    if (ret)
-        ESP_LOGE(DEBUG_TAG, "%s enable controller failed\n", __func__);
-	
-	if (!ret)
-		ret = esp_bluedroid_init();
-    if (ret)
-        ESP_LOGE(DEBUG_TAG, "%s init bluetooth failed\n", __func__);
-
-	if (!ret)
-		ret = esp_bluedroid_enable();
-    if (ret)
-        ESP_LOGE(DEBUG_TAG, "%s enable bluetooth failed\n", __func__);
-
-	if (!ret)
-		ret = esp_ble_gatts_register_callback(gatts_event_handler);
-    if (ret)
-        ESP_LOGE(DEBUG_TAG, "gatts register error, error code = %x", ret);
-
-	if (!ret)
-		ret = esp_ble_gap_register_callback(gap_event_handler);
-    if (ret)
-        ESP_LOGE(DEBUG_TAG, "gap register error, error code = %x", ret);
-    
-	if (!ret)
-		ret = esp_ble_gatts_app_register(ESP_APP_ID);
-    if (ret)
-        ESP_LOGE(DEBUG_TAG, "gatts app register error, error code = %x", ret);
-
-	if (!ret)
-		ret = esp_ble_gatt_set_local_mtu(512);
-    if (ret)
-        ESP_LOGE(DEBUG_TAG, "set local  MTU failed, error code = %x", ret);
-	
 	// Start CAN
     ESP_LOGI(DEBUG_TAG, "Starting CAN");
-    can_general_config_t g_config = CAN_GENERAL_CONFIG_DEFAULT(GPIO_NUM_5, GPIO_NUM_4, CAN_MODE_NORMAL);
-    can_timing_config_t t_config = CAN_TIMING_CONFIG_500KBITS();
-    can_filter_config_t f_config = CAN_FILTER_CONFIG_ACCEPT_ALL();
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(GPIO_NUM_21, GPIO_NUM_22, TWAI_MODE_NORMAL);
+    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_250KBITS();
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
-    //Install CAN driver
-    if (can_driver_install(&g_config, &t_config, &f_config) != ESP_OK)
+	//Install TWAI driver
+    if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) 
+	{
+        ESP_LOGI(DEBUG_TAG, "CAN driver installed\n");
+    } 
+	else 
 	{
         ESP_LOGE(DEBUG_TAG, "Failed to install CAN driver\n");
-        return;
     }
 
-    //Start CAN driver
-    if (can_start() != ESP_OK) 
+    //Start TWAI driver
+    if (twai_start() == ESP_OK) 
+	{
+        ESP_LOGI(DEBUG_TAG, "CAN driver started\n");
+    } 
+	else 
 	{
         ESP_LOGE(DEBUG_TAG, "Failed to start CAN driver\n");
-        return;
     }
 	
-	xTaskCreate(&task_CAN, "CAN", 2048, NULL, 5, NULL);
-	xTaskCreate(&task_BLE, "BLE", 2048, NULL, 5, NULL);
+	
+	gpio_set_direction(GPIO_NUM_16, GPIO_MODE_OUTPUT);
+	gpio_set_level(GPIO_NUM_16, green_led_status);
+	
+	//SD Card must be ejected while programming. 
+	
+	xTaskCreate(&task_CAN, "CAN", 4096, NULL, 5, NULL);
 	xTaskCreate(tcp_server_task, "tcp_server", 4096, NULL, 5, NULL);
+	xTaskCreate(&logger_task, "logger", 4096, NULL, 5, NULL);
 }

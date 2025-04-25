@@ -46,6 +46,8 @@ function to process requests, decode URLs, serve files, etc. etc.
 #include "wifi_manager.h"
 #include "http_app.h"
 
+extern volatile bool clear_log;
+
 
 /* @brief tag used for ESP serial console messages */
 static const char TAG[] = "http_server";
@@ -309,6 +311,55 @@ static esp_err_t http_server_get_handler(httpd_req_t *req){
 				httpd_resp_set_status(req, http_503_hdr);
 				httpd_resp_send(req, NULL, 0);
 				ESP_LOGE(TAG, "http_server_netconn_serve: GET /status.json failed to obtain mutex");
+			}
+		}
+		else if(strcmp(req->uri, "/clear") == 0){
+			ESP_LOGI(TAG, "GOT CLEAR request");
+			
+			httpd_resp_set_status(req, http_200_hdr);
+			httpd_resp_set_type(req, http_content_type_html);
+			httpd_resp_set_hdr(req, http_cache_control_hdr, http_cache_control_no_cache);
+			httpd_resp_set_hdr(req, http_pragma_hdr, http_pragma_no_cache);
+			
+			clear_log = true;
+		}
+		else if(strcmp(req->uri, "/log") == 0){
+			ESP_LOGI(TAG, "GOT LOG request");
+			
+			httpd_resp_set_status(req, http_200_hdr);
+			httpd_resp_set_type(req, http_content_type_html);
+			httpd_resp_set_hdr(req, http_cache_control_hdr, http_cache_control_no_cache);
+			httpd_resp_set_hdr(req, http_pragma_hdr, http_pragma_no_cache);
+			
+			FILE *f = fopen("/sdcard/log.csv", "r");
+			if (f == NULL) 
+			{
+				ESP_LOGE(TAG, "Failed to open log.csv");
+			}
+			else
+			{
+				char chunk[1024];
+				size_t chunksize;
+				do {
+					/* Read file in chunks into the scratch buffer */
+					chunksize = fread(chunk, 1, 1024, f);
+					ESP_LOGI(TAG, "Read chunk");
+
+					if (chunksize > 0) {
+						ESP_LOGI(TAG, "Sending");
+						if (httpd_resp_send_chunk(req, chunk, chunksize) != ESP_OK) {
+							ESP_LOGE(TAG, "File sending failed!");
+							/* Abort sending file */
+							httpd_resp_sendstr_chunk(req, NULL);
+							/* Respond with 500 Internal Server Error */
+							httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to send file");
+							break;
+					   }
+					}
+				} while (chunksize != 0);
+				fclose(f);
+				
+				httpd_resp_send_chunk(req, NULL, 0);
 			}
 		}
 		else{
